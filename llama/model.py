@@ -29,6 +29,8 @@ class ModelArgs:
 
     max_batch_size: int = 32
     max_seq_len: int = 2048
+    
+    device="cuda"
 
 
 class RMSNorm(torch.nn.Module):
@@ -173,6 +175,21 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
     )
 
 
+class KVCache:
+    def __init__(self, max_batch_size, max_seq_len, n_kv_heads, head_dim, device):
+        self.cache_k = torch.zeros((max_batch_size, max_seq_len, n_kv_heads, head_dim)).to(device)
+        self.cache_v = torch.zeros((max_batch_size, max_seq_len, n_kv_heads, head_dim)).to(device)
+
+    def update(self, batch_size, start_pos, xk, xv):
+        self.cache_k[:batch_size, start_pos :start_pos + xk.size(1)] = xk
+        self.cache_v[:batch_size, start_pos :start_pos + xv.size(1)] = xv
+
+    def get(self, batch_size, start_pos, seq_len):
+        keys = self.cache_k[:batch_size,  :start_pos + seq_len]
+        values = self.cache_v[:batch_size, :start_pos + seq_len]
+        return keys, values
+
+
 class Attention(nn.Module):
     """Multi-head attention module."""
     def __init__(self, args: ModelArgs):
@@ -232,23 +249,29 @@ class Attention(nn.Module):
             input_is_parallel=True,
             init_method=lambda x: x,
         )
-
-        self.cache_k = torch.zeros(
-            (
-                args.max_batch_size,
-                args.max_seq_len,
-                self.n_local_kv_heads,
-                self.head_dim,
-            )
-        ).cuda()
-        self.cache_v = torch.zeros(
-            (
-                args.max_batch_size,
-                args.max_seq_len,
-                self.n_local_kv_heads,
-                self.head_dim,
-            )
-        ).cuda()
+        self.cache = KVCache(
+            max_batch_size=args.max_batch_size,
+            max_seq_len=args.max_seq_len,
+            n_kv_heads=self.n_kv_heads,
+            head_dim=self.head_dim,
+            device=args.device
+        )
+        #self.cache_k = torch.zeros(
+        #    (
+        #        args.max_batch_size,
+        #        args.max_seq_len,
+        #        self.n_local_kv_heads,
+        #        self.head_dim,
+        #    )
+        #).cuda()
+        #self.cache_v = torch.zeros(
+        #    (
+        #        args.max_batch_size,
+        #        args.max_seq_len,
+        #        self.n_local_kv_heads,
+        #        self.head_dim,
+        #    )
+        #).cuda()
 
     def forward(
         self,
@@ -271,58 +294,51 @@ class Attention(nn.Module):
 
         """
         # assume model_parallel_size = 1, n_local_heads = n_heads
-        # get batch size and seq len, seq_len is always 1 during inference
+        # get batch size and seq len, seqlen is always 1 during inference
         bsz, seqlen, _ = x.shape
         
         # 1) Linear projections
-        # (bsz, seq_len, dim)
+        # (bsz, seqlen, dim)
         xq = self.wq(x)
-        # (bsz, seq_len, h_kv * head_dim)
+        # (bsz, seqlen, n_kv_heads * head_dim)
         xk = self.wk(x)
         xv = self.wv(x)
 
         # 2) Split & reshape Q, K & V
-        # (bsz, seq_len, n_heads, head_dim)
+        # (bsz, seqlen, n_heads, head_dim)
         xq = xq.view(bsz, seqlen, self.n_heads, self.head_dim)
-        # (bsz, seq_len, n_kv_heads, head_dim)
+        # (bsz, seqlen, n_kv_heads, head_dim)
         xk = xk.view(bsz, seqlen, self.n_kv_heads, self.head_dim)
         xv = xv.view(bsz, seqlen, self.n_kv_heads, self.head_dim)
 
         # 3) Apply rotary embeddings to Q & K
-        # xq: (bsz, seq_len, n_heads, head_dim)
-        # xk: (bsz, seq_len, n_kv_heads, head_dim)
+        # xq: (bsz, seqlen, n_heads, head_dim)
+        # xk: (bsz, seqlen, n_kv_heads, head_dim)
         xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
 
         # 4) Replace the entry in the cache
-        self.cache_k = self.cache_k.to(xq)
-        self.cache_v = self.cache_v.to(xq)
+        self.cache.update(bsz, start_pos, xk, xv)
+        # (m, : seqlen, h_kv, head_dim)
+        keys, values = self.cache.get(bsz, start_pos, seqlen)
 
-        # update cache
-        self.cache_k[:bsz, start_pos : start_pos + seqlen] = xk
-        self.cache_v[:bsz, start_pos : start_pos + seqlen] = xv
-
-        # (bsz, seq_len, n_kv_heads, head_dim)
-        keys = self.cache_k[:bsz, : start_pos + seqlen]
-        values = self.cache_v[:bsz, : start_pos + seqlen]
-
-        # (bsz, seq_len, n_kv_heads, head_dim) --> (bsz, seq_len, n_heads, head_dim)
+        # (bsz, : seqlen, n_kv_heads, head_dim) --> (bsz, : seqlen, n_heads, head_dim)
         keys = repeat_kv(keys, self.n_rep)
         values = repeat_kv(values, self.n_rep) 
 
-        # 5) Attention scores
-        # seq_len is 1 for xq during inference
-        # (bsz, n_heads, seq_len, head_dim)
+        # (bsz, n_heads, seqlen, head_dim)
         xq = xq.transpose(1, 2)
-        # (m, n_heads, seq_len, head_dim)
+        # (bsz, n_heads, : seqlen, head_dim)
         keys = keys.transpose(1, 2)
         values = values.transpose(1, 2)
-        # (bsz, n_heads, seq_len, head_dim) @ (m, n_heads, head_dim, seq_len) -> (m, n_heads, seq_len, seq_len) 
+        
+        # 5) Attention scores
+        # (bsz, n_heads, seqlen, head_dim) @ (mbsz, n_heads, head_dim, : seqlen) -> (bsz, n_heads, seqlen, : seqlen) 
         scores = torch.matmul(xq, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
         if mask is not None:
             scores = scores + mask
-        # (bsz, n_heads, seq_len, seq_len)
+        # (bsz, n_heads, seqlen, : seqlen)
         scores = F.softmax(scores.float(), dim=-1).type_as(xq)
-        # (bsz, n_heads, seq_len, seq_len) @ (m, n_heads, seq_len, head_dim) -> (m, n_heads, seq_len, head_dim)
+        # (bsz, n_heads, seqlen, : seqlen) @ (bsz, n_heads, : seqlen, head_dim) -> (m, n_heads, seqlen, head_dim)
         output = torch.matmul(scores, values)
         
         # 6) Merge/Concatenate heads
@@ -548,8 +564,11 @@ class Transformer(nn.Module):
             torch.Tensor: Output logits after applying the Transformer model.
 
         """
+        # (bsz, seq_len)
         _bsz, seqlen = tokens.shape
+        # (bsz, seq_len) -> (bsz, seq_len, embed_dim)
         h = self.tok_embeddings(tokens)
+        # (seq_len, (embed_dim/n_heads)/2]
         self.freqs_cis = self.freqs_cis.to(h.device)
         freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]
 
@@ -570,8 +589,10 @@ class Transformer(nn.Module):
                 mask
             ]).type_as(h)
 
+        # (bsz, seq_len, dim)
         for layer in self.layers:
             h = layer(h, start_pos, freqs_cis, mask)
         h = self.norm(h)
+        # (bsz, seq_len, vocab_size)
         output = self.output(h).float()
         return output
